@@ -1877,6 +1877,12 @@ function getNodeHTTPServerSocket() {
       if (!this.destroyed) {
         this.destroy();
       }
+      // A tunnel write that waited for a drain fails now. After destroy(), it settles the callbacks of Writable and emits no 'error'.
+      const pendingCallback = this.#pendingCallback;
+      if (pendingCallback) {
+        this.#pendingCallback = null;
+        (pendingCallback as Function)(writeFailure);
+      }
     }
     #onCloseForDestroy(closeCallback, err?: Error) {
       this.#onClose();
