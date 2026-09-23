@@ -415,14 +415,19 @@ impl Connection {
         sink.on_recv_window(self.recv_window.size, self.recv_window.consumed);
     }
 
+    /// Applies the queued `LocalWindow` changes. It writes nothing, so it runs no JS.
+    pub(crate) fn apply_recv_window_changes(&mut self, sink: &impl Sink) {
+        let change = sink.take_recv_window_change();
+        if change != RecvWindowChange::default() {
+            self.recv_window.apply(change);
+            self.note_recv_window(sink);
+        }
+    }
+
     /// Applies the queued `LocalWindow` changes, and sends each WINDOW_UPDATE that comes due.
     pub(crate) fn sync_recv_window(&mut self, sink: &impl Sink) {
         loop {
-            let change = sink.take_recv_window_change();
-            if change != RecvWindowChange::default() {
-                self.recv_window.apply(change);
-                self.note_recv_window(sink);
-            }
+            self.apply_recv_window_changes(sink);
             // A WINDOW_UPDATE write can run JS that queues another change.
             if !self.replenish_connection_window(sink) {
                 return;

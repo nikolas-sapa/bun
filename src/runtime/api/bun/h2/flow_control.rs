@@ -134,7 +134,7 @@ impl RecvWindow {
 
     #[inline]
     pub(crate) fn apply(&mut self, change: RecvWindowChange) {
-        self.size += change.size;
+        self.grow(change.size);
         self.consumed += change.consumed;
     }
 }

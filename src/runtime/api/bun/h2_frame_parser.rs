@@ -3548,6 +3548,23 @@ impl H2FrameParser {
         }
     }
 
+    /// Runs `f` on the idle engine, then reads what a re-entrant read() queued while `f` wrote.
+    fn with_idle_engine(&self, f: impl FnOnce(&mut crate::api::h2::connection::Connection)) {
+        let queued = self.rewrite_tail.get().len();
+        {
+            let Ok(mut guard) = self.engine.try_borrow_mut() else {
+                return;
+            };
+            let Some(engine) = guard.as_mut() else {
+                return;
+            };
+            f(engine);
+        }
+        if self.rewrite_tail.get().len() != queued {
+            self.rewrite_read(&[]);
+        }
+    }
+
     /// Feed inbound bytes through the rewrite engine, buffering the unconsumed tail (design B).
     fn rewrite_read(&self, bytes: &[u8]) {
         bun_output::scoped_log!(H2FrameParser, "rewriteRead {}", bytes.len());
@@ -3574,8 +3591,8 @@ impl H2FrameParser {
             if self.write_buffer.get().slice()[self.write_buffer_offset.get()..].is_empty() {
                 engine.note_outbound_drained();
             }
-            // Apply what setLocalWindowSize() queued before the engine existed or in a dispatch.
-            engine.sync_recv_window(self);
+            // Apply what setLocalWindowSize() queued before the engine existed. No write here.
+            engine.apply_recv_window_changes(self);
             // Apply outbound DATA the legacy encoder wrote since the last batch, so the engine's
             // send windows reflect what is actually in flight (§6.9.1 overflow stays peer-error
             // only).
@@ -4575,11 +4592,7 @@ impl H2FrameParser {
             this.send_window_update(0, UInt31WithReserved::init(increment as u32, false));
         }
         // If a dispatch holds the engine, or no read has created it yet, the change stays queued.
-        if let Ok(mut guard) = this.engine.try_borrow_mut()
-            && let Some(engine) = guard.as_mut()
-        {
-            engine.sync_recv_window(this);
-        }
+        this.with_idle_engine(|engine| engine.sync_recv_window(this));
         Ok(JSValue::UNDEFINED)
     }
 
@@ -5431,11 +5444,7 @@ impl H2FrameParser {
             // Resumed: send the deferred WINDOW_UPDATE now. try_borrow: a resume issued from
             // inside a dispatch (the engine borrow is held by rewrite_read) is covered by the
             // batch-end replenish instead.
-            if let Ok(mut guard) = this.engine.try_borrow_mut() {
-                if let Some(engine) = guard.as_mut() {
-                    engine.replenish_stream(this, stream_id);
-                }
-            }
+            this.with_idle_engine(|engine| engine.replenish_stream(this, stream_id));
             let _ = this.flush();
         }
         Ok(JSValue::UNDEFINED)
