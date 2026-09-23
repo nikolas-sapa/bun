@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { bunEnv, bunExe, normalizeBunSnapshot, tempDir } from "harness";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "path";
 
 test("coverage crash", () => {
@@ -55,6 +55,33 @@ export class Y {
   expect(normalizeBunSnapshot(readFileSync(path.join(dir, "coverage", "lcov.info"), "utf-8"), dir)).toMatchSnapshot(
     "lcov-coverage-reporter-output",
   );
+});
+
+// lcov.info is written to a temporary name in coverage/ and renamed over the
+// previous report. When a previous report exists the rename is an exchange, so
+// the temporary name then holds the old report. It must not be left behind.
+test("lcov reporter leaves only lcov.info in the coverage dir on repeated runs", async () => {
+  using dir = tempDir("cov-lcov-rerun", {
+    "math.ts": `export const add = (a: number, b: number) => a + b;\n`,
+    "demo.test.ts": `
+import { expect, test } from "bun:test";
+import { add } from "./math";
+test("ok", () => expect(add(1, 1)).toBe(2));
+`,
+  });
+  for (let i = 0; i < 2; i++) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", "--coverage", "--coverage-reporter=lcov"],
+      cwd: String(dir),
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toContain("1 pass");
+    expect(exitCode).toBe(0);
+  }
+  expect(readdirSync(path.join(String(dir), "coverage"))).toEqual(["lcov.info"]);
 });
 
 test("coverage excludes node_modules directory", () => {

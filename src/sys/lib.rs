@@ -8993,7 +8993,8 @@ pub(crate) fn move_file_z_slow_maybe(
 }
 
 /// `renameatConcurrently`. Tries an atomic NOREPLACE rename,
-/// then EXCHANGE, then a racy delete-tree + rename. With `move_fallback` set,
+/// then EXCHANGE (and deletes the old destination, which the exchange leaves
+/// at `from`), then a racy delete-tree + rename. With `move_fallback` set,
 /// an EXDEV result falls through to a slow open/copy.
 pub fn renameat_concurrently(
     from_dir_fd: Fd,
@@ -9064,7 +9065,15 @@ pub(crate) fn renameat_concurrently_without_fallback(
                         },
                     ) {
                         Err(_) => {}
-                        Ok(()) => break 'attempt,
+                        Ok(()) => {
+                            // `from` now names what was at `to`. A rename leaves nothing at `from`.
+                            if from_dir_fd.is_valid() {
+                                let _ = Dir::borrow(&from_dir_fd).delete_tree(from.as_bytes());
+                            } else {
+                                let _ = delete_tree_absolute(from.as_bytes());
+                            }
+                            break 'attempt;
+                        }
                     }
                 }
             }

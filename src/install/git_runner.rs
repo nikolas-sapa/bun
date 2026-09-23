@@ -313,9 +313,8 @@ impl CacheStaging {
                 move_fallback: false,
             },
         );
-        // After an exchange the temporary name holds the folder that was replaced.
-        self.discard();
         if let Err(err) = renamed {
+            self.discard();
             log.add_error_fmt(
                 None,
                 bun_ast::Loc::EMPTY,
