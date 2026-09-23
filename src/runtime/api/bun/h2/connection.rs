@@ -207,6 +207,10 @@ pub(crate) trait Sink {
     fn take_recv_window_change(&self) -> RecvWindowChange {
         RecvWindowChange::default()
     }
+    /// True if a call found the connection borrowed since the last take (`replenish_windows`).
+    fn take_deferred(&self) -> bool {
+        false
+    }
     /// Transition shim while the outbound path still flows through the embedder's legacy encoder:
     /// returns true if `stream_id` was initiated locally (HEADERS already sent by the embedder), so
     /// inbound frames for it are not treated as frames on an idle stream.
@@ -596,24 +600,32 @@ impl Connection {
 
     /// Send WINDOW_UPDATE for every receive window that has consumed at least half its size.
     pub(crate) fn replenish_windows(&mut self, sink: &impl Sink) {
-        self.sync_recv_window(sink);
-        let mut buf = std::mem::take(&mut self.replenish_buf);
-        buf.clear();
-        for (id, s) in self.streams.iter_mut() {
-            if s.state != State::Closed
-                && s.recv_window.needs_update()
-                && sink.is_stream_reading(*id)
-            {
-                let inc = s.recv_window.take_update();
-                if inc > 0 {
-                    buf.push((*id, inc));
+        loop {
+            // This pass covers every call that was deferred before it.
+            let _ = sink.take_deferred();
+            self.sync_recv_window(sink);
+            let mut buf = std::mem::take(&mut self.replenish_buf);
+            buf.clear();
+            for (id, s) in self.streams.iter_mut() {
+                if s.state != State::Closed
+                    && s.recv_window.needs_update()
+                    && sink.is_stream_reading(*id)
+                {
+                    let inc = s.recv_window.take_update();
+                    if inc > 0 {
+                        buf.push((*id, inc));
+                    }
                 }
             }
+            for (id, inc) in buf.iter() {
+                self.send_window_update(sink, *id, *inc);
+            }
+            self.replenish_buf = buf;
+            // JS that ran in those writes can have deferred a call. Only another pass covers it.
+            if !sink.take_deferred() {
+                break;
+            }
         }
-        for (id, inc) in buf.iter() {
-            self.send_window_update(sink, *id, *inc);
-        }
-        self.replenish_buf = buf;
         // Evict closed streams so the map (and this scan) stay bounded on long-lived connections.
         // A late DATA/RST/WINDOW_UPDATE for an evicted id takes the unknown-stream path, which
         // answers RST_STREAM(STREAM_CLOSED) - the 5.1 closed-state behavior. A late HEADERS for an

@@ -3562,7 +3562,7 @@ impl H2FrameParser {
                 return;
             };
             f(engine);
-            while self.engine_work_deferred.replace(false) {
+            if self.engine_work_deferred.get() {
                 engine.replenish_windows(self);
             }
         }
@@ -3713,8 +3713,6 @@ impl H2FrameParser {
                 break;
             }
         }
-        // The batch ends above covered every call that found the engine borrowed.
-        self.engine_work_deferred.set(false);
         // Uncork: flush the engine's queued control/response frames to the socket.
         let _ = self.flush();
     }
@@ -3742,6 +3740,10 @@ impl crate::api::h2::connection::Sink for H2FrameParser {
 
     fn take_recv_window_change(&self) -> RecvWindowChange {
         self.pending_recv_window_change.take()
+    }
+
+    fn take_deferred(&self) -> bool {
+        self.engine_work_deferred.replace(false)
     }
 
     fn write(&self, bytes: &[u8]) -> crate::api::h2::connection::WriteResult {
