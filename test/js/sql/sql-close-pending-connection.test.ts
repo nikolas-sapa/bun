@@ -21,6 +21,7 @@ import { expect, mock, test } from "bun:test";
 import type { Server, Socket } from "node:net";
 import {
   listeningServer,
+  mysqlAckSessionSetup,
   mysqlHandshakeV10,
   mysqlOkPacket,
   mysqlReadPackets,
@@ -241,6 +242,7 @@ async function mysqlReadyServer(
           socket.write(mysqlOkPacket(seq + 1));
           return;
         }
+        if (mysqlAckSessionSetup(socket, payload)) return;
         onCommand?.(socket, seq, payload);
         received.resolve();
       });
