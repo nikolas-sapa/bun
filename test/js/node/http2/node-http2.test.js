@@ -5834,49 +5834,58 @@ describe("setLocalWindowSize() and bodies larger than the initial stream window"
 // earn no WINDOW_UPDATE. A later raise first repays the withheld credit and sends only the rest.
 // The decrease used to be ignored, so the raise granted the peer more window than was asked for.
 describe("setLocalWindowSize() with a smaller window", () => {
-  // A raw h2 server that records each connection-level WINDOW_UPDATE increment it receives, and
-  // each stream-level one as [streamId, increment]. The `...AtPing` arrays hold a copy of both
-  // for each PING, taken before the answer.
-  async function windowUpdateServer(onRequest = () => {}) {
-    const increments = [];
-    const incrementsAtPing = [];
-    const streamIncrements = [];
-    const streamIncrementsAtPing = [];
-    const server = net.createServer(socket => {
-      let buf = Buffer.alloc(0);
-      let sawPreface = false;
-      socket.on("error", () => {});
-      socket.write(new http2utils.SettingsFrame(false).data);
-      socket.on("data", chunk => {
-        buf = Buffer.concat([buf, chunk]);
-        if (!sawPreface) {
-          if (buf.length < http2utils.kClientMagic.length) return;
-          buf = buf.subarray(http2utils.kClientMagic.length);
-          sawPreface = true;
+  const newFrameLog = () => ({
+    increments: [],
+    incrementsAtPing: [],
+    streamIncrements: [],
+    streamIncrementsAtPing: [],
+  });
+
+  // Speaks raw h2 on `socket`: it answers SETTINGS and PING. In `log` it records each
+  // connection-level WINDOW_UPDATE increment, and each stream-level one as [streamId, increment].
+  // The `...AtPing` arrays hold a copy of both for each PING, taken before the answer.
+  function rawPeer(socket, log, onRequest) {
+    let buf = Buffer.alloc(0);
+    let sawPreface = false;
+    socket.on("error", () => {});
+    socket.write(new http2utils.SettingsFrame(false).data);
+    socket.on("data", chunk => {
+      buf = Buffer.concat([buf, chunk]);
+      if (!sawPreface) {
+        if (buf.length < http2utils.kClientMagic.length) return;
+        buf = buf.subarray(http2utils.kClientMagic.length);
+        sawPreface = true;
+      }
+      while (buf.length >= 9) {
+        const length = buf.readUIntBE(0, 3);
+        if (buf.length < 9 + length) break;
+        const type = buf[3];
+        const isAck = (buf[4] & 1) !== 0;
+        const streamId = buf.readUInt32BE(5) & 0x7fffffff;
+        const payload = buf.subarray(9, 9 + length);
+        buf = buf.subarray(9 + length);
+        if (type === 4 && !isAck) socket.write(new http2utils.SettingsFrame(true).data);
+        if (type === 6 && !isAck) {
+          log.incrementsAtPing.push([...log.increments]);
+          log.streamIncrementsAtPing.push([...log.streamIncrements]);
+          socket.write(Buffer.concat([new http2utils.Frame(8, 6, 1, 0).data, payload]));
         }
-        while (buf.length >= 9) {
-          const length = buf.readUIntBE(0, 3);
-          if (buf.length < 9 + length) break;
-          const type = buf[3];
-          const isAck = (buf[4] & 1) !== 0;
-          const streamId = buf.readUInt32BE(5) & 0x7fffffff;
-          const payload = buf.subarray(9, 9 + length);
-          buf = buf.subarray(9 + length);
-          if (type === 4 && !isAck) socket.write(new http2utils.SettingsFrame(true).data);
-          if (type === 6 && !isAck) {
-            incrementsAtPing.push([...increments]);
-            streamIncrementsAtPing.push([...streamIncrements]);
-            socket.write(Buffer.concat([new http2utils.Frame(8, 6, 1, 0).data, payload]));
-          }
-          if (type === 8 && streamId === 0) increments.push(payload.readUInt32BE(0) & 0x7fffffff);
-          if (type === 8 && streamId !== 0) streamIncrements.push([streamId, payload.readUInt32BE(0) & 0x7fffffff]);
-          if (type === 1) onRequest(socket, streamId);
+        if (type === 8) {
+          const increment = payload.readUInt32BE(0) & 0x7fffffff;
+          if (streamId === 0) log.increments.push(increment);
+          else log.streamIncrements.push([streamId, increment]);
         }
-      });
+        if (type === 1) onRequest(socket, streamId);
+      }
     });
+  }
+
+  // A raw h2 server on TCP. See rawPeer() for what it records.
+  async function windowUpdateServer(onRequest = () => {}) {
+    const log = newFrameLog();
+    const server = net.createServer(socket => rawPeer(socket, log, onRequest));
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-    const url = `http://127.0.0.1:${server.address().port}`;
-    return { server, increments, incrementsAtPing, streamIncrementsAtPing, url };
+    return { server, ...log, url: `http://127.0.0.1:${server.address().port}` };
   }
 
   function windowState(session) {
@@ -6158,6 +6167,63 @@ describe("setLocalWindowSize() with a smaller window", () => {
       other.destroy();
       client.destroy();
       server.close();
+    }
+  });
+
+  // A session on a JS transport reads inside a JS call, so a cork that another session makes
+  // during the read is still there at the end of the batch. The batch-end WINDOW_UPDATE write
+  // flushes it, and JS in that flush can call setLocalWindowSize(). That call came too late for
+  // the pass that was running, and it used to wait for the next frame.
+  it("a setLocalWindowSize() call from inside a batch-end write takes effect in that batch", async () => {
+    let nested = () => {};
+    const duplex = new Duplex({
+      read() {},
+      write(chunk, encoding, callback) {
+        nested();
+        callback();
+      },
+    });
+    const other = http2.connect("http://127.0.0.1:1", { createConnection: () => duplex });
+    other.on("error", () => {});
+    await new Promise(resolve => other.once("connect", resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    // One write, so the client reads it in one batch: 65535 bytes of DATA, then a PING.
+    const [clientSide, serverSide] = duplexPair();
+    const log = newFrameLog();
+    rawPeer(serverSide, log, (socket, streamId) => {
+      socket.write(
+        Buffer.concat([
+          new http2utils.HeadersFrame(streamId, Buffer.from([0x88]), 0, true).data, // :status 200
+          ...[16384, 16384, 16384, 16383].map(size => new http2utils.DataFrame(streamId, Buffer.alloc(size, "x")).data),
+          new http2utils.PingFrame(false).data,
+        ]),
+      );
+    });
+    const client = http2.connect("http://localhost", { createConnection: () => clientSide });
+    try {
+      const { promise, resolve, reject } = Promise.withResolvers();
+      client.on("error", reject);
+      client.once("connect", () => {
+        client.setLocalWindowSize(0);
+        // 'ping' runs inside the read, after the DATA, and `other` corks a PING there. The next
+        // write of the client is the stream WINDOW_UPDATE at the end of the batch.
+        client.once("ping", () => {
+          nested = () => {
+            nested = () => {};
+            // The raise repays the 65535 bytes that the peer used, so a WINDOW_UPDATE is due.
+            client.setLocalWindowSize(65535);
+            setImmediate(() => client.ping(() => resolve({ increments: log.incrementsAtPing.at(-1) })));
+          };
+          other.ping(() => {});
+        });
+        client.request({ ":path": "/" }).on("error", reject);
+      });
+      // The WINDOW_UPDATE is on the wire before the last PING. No frame came in between.
+      expect(await promise).toEqual({ increments: [65535] });
+    } finally {
+      other.destroy();
+      client.destroy();
     }
   });
 
