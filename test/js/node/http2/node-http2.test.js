@@ -6106,36 +6106,38 @@ describe("setLocalWindowSize() with a smaller window", () => {
     await new Promise(resolve => other.once("connect", resolve));
     await new Promise(resolve => setImmediate(resolve));
 
-    // 80000 bytes: more than the 64 KiB that the stream buffers, so the stream is paused and its
-    // WINDOW_UPDATE waits for a read. It is also most of the 100000 that both windows allow.
+    // The stream buffers 64 KiB and then pauses, so its WINDOW_UPDATE waits for a read. With a
+    // stream window of 200000, that update comes due at 100000 bytes, after the pause. So no
+    // update goes out early, however the transport splits these 120000 bytes into reads.
     const { server, incrementsAtPing, streamIncrementsAtPing, url } = await windowUpdateServer((socket, streamId) => {
       socket.write(new http2utils.HeadersFrame(streamId, Buffer.from([0x88]), 0, true).data); // :status 200
-      for (const size of [16384, 16384, 16384, 16384, 14464]) {
+      for (const size of [16384, 16384, 16384, 16384, 16384, 16384, 16384, 5312]) {
         socket.write(new http2utils.DataFrame(streamId, Buffer.alloc(size, "x")).data);
       }
     });
-    const client = http2.connect(url, { settings: { initialWindowSize: 100000 } });
+    const client = http2.connect(url, { settings: { initialWindowSize: 200000 } });
     try {
       const { promise, resolve, reject } = Promise.withResolvers();
       client.on("error", reject);
       client.once("connect", () => {
-        // The peer learns about 100000 bytes of connection window. All of it is then withheld.
-        client.setLocalWindowSize(100000);
+        // The peer learns about 150000 bytes of connection window. All of it is then withheld.
+        client.setLocalWindowSize(150000);
         client.setLocalWindowSize(0);
         const req = client.request({ ":path": "/" });
         req.on("error", reject);
-        // The server answers this PING after the DATA, so all 80000 bytes are in by then.
+        // The server answers this PING after the DATA, so all 120000 bytes are in by then.
         client.ping(() =>
           setImmediate(() => {
-            // The raise repays the 80000 bytes that the peer used, so it writes a WINDOW_UPDATE.
+            // The raise repays the 120000 bytes that the peer used, so it writes a WINDOW_UPDATE.
             // That write flushes the PING that `other` corked, and the flush runs the read().
-            let resumed = false;
+            // A read of the whole buffer always reaches _read(), which resumes the stream.
+            let resumed = 0;
             nested = () => {
               nested = () => {};
-              resumed = req.read() !== null;
+              resumed = req.read(req.readableLength).length;
             };
             other.ping(() => {});
-            client.setLocalWindowSize(100000);
+            client.setLocalWindowSize(150000);
             client.ping(() =>
               resolve({
                 resumed,
@@ -6148,9 +6150,9 @@ describe("setLocalWindowSize() with a smaller window", () => {
       });
       // Both frames are on the wire before the last PING. No frame came in between.
       expect(await promise).toEqual({
-        resumed: true,
-        increments: [100000 - 65535, 80000],
-        streamIncrements: [[1, 80000]],
+        resumed: 120000,
+        increments: [150000 - 65535, 120000],
+        streamIncrements: [[1, 120000]],
       });
     } finally {
       other.destroy();
