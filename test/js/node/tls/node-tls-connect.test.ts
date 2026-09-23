@@ -143,6 +143,17 @@ it("should have checkServerIdentity", async () => {
   expect(tls.checkServerIdentity).toBeFunction();
 });
 
+// domainToASCII passes an ASCII host through (whatwg/url#914), so a live host such as xn--8i7caa.famitei.net matches
+// its certificate. Expected values are from Node v26.10.0.
+it("checkServerIdentity matches an ASCII host whose xn-- label fails ToASCII", () => {
+  const cert = { subject: { CN: "x" }, subjectaltname: "DNS:xn--a.example, DNS:*.xn--1ug.test" } as any;
+  expect(
+    ["xn--a.example", "XN--A.example", "a.xn--1ug.test", "\u00e9.xn--a.example", "other.example"].map(
+      host => checkServerIdentity(host, cert)?.code,
+    ),
+  ).toEqual([undefined, undefined, undefined, "ERR_TLS_CERT_ALTNAME_INVALID", "ERR_TLS_CERT_ALTNAME_INVALID"]);
+});
+
 it("should thow ECONNRESET if FIN is received before handshake", async () => {
   await using server = net.createServer(c => {
     // resume() so the ClientHello the peer still sends is discarded and `c`

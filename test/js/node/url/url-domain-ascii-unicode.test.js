@@ -112,6 +112,7 @@ describe.skipIf(parseInt(process.versions.icu) < 76)(
       ["xn--xn--zca-hia", "xn--xn--zca-hia"],
       ["xn--xn---epa", "xn--xn---epa"],
       ["XN--XN--ZCA-HIA.Example", "xn--xn--zca-hia.example"],
+      ["xn--xn--zca-7pj", "xn--xn--zca-7pj"], // decodes to "xn--zcaا"
       // The valid labels still decode.
       ["a.xn--xn--ab-gva.b", "a.xn--xn--ab-gva.b"],
       ["xn--zca.xn--xn--zca-hia", "ß.xn--xn--zca-hia"],
@@ -121,6 +122,41 @@ describe.skipIf(parseInt(process.versions.icu) < 76)(
     });
   },
 );
+
+describe("url.domainToUnicode with an xn-- label that fails an older UTS #46 rule", () => {
+  test.each([
+    ["xn--a", "xn--a"], // decodes to U+0080 (disallowed)
+    ["xn--1ug.com", "xn--1ug.com"], // ZWJ alone (CONTEXTJ)
+    ["xn--u-ccb.com", "xn--u-ccb.com"], // leading combining mark
+    ["xn--zn7c.com", "xn--zn7c.com"], // decodes to U+FFFD
+    ["xn--", "xn--"],
+    ["xn--maana-pta.xn--a.com", "mañana.xn--a.com"],
+  ])("%s", (input, expected) => {
+    expect(url.domainToUnicode(input)).toBe(expected);
+  });
+});
+
+// https://github.com/whatwg/url/pull/914: an ASCII domain passes through the host parser, lowercased, even when an
+// xn-- label fails Unicode ToASCII. Expected values are from Node v26.10.0.
+describe("url.domainToASCII with an xn-- label that fails UTS #46", () => {
+  test.each([
+    ["xn--a", "xn--a"],
+    ["XN--A.Com", "xn--a.com"],
+    ["xn--1ug.example", "xn--1ug.example"],
+    ["xn--xn--zca-hia", "xn--xn--zca-hia"],
+    ["xn--8i7caa.famitei.net", "xn--8i7caa.famitei.net"],
+    ["%78n--a", "xn--a"],
+    ["xn--zca.xn--a", "xn--zca.xn--a"],
+    // Unicode ToASCII still runs for a non-ASCII domain, and the host parser still applies its other rules.
+    ["\u00e9.xn--a", ""],
+    ["\u00e9.%78n--a", ""],
+    ["xn--a.1", ""],
+    ["xn--a b", ""],
+    ["\u00e9.xn--ls8h", "xn--9ca.xn--ls8h"],
+  ])("%s", (input, expected) => {
+    expect(url.domainToASCII(input)).toBe(expected);
+  });
+});
 
 describe("url.domainToUnicode with many xn-- labels", () => {
   // The conversion runs once per xn-- label. The whole-name ICU conversion
@@ -135,43 +171,47 @@ describe("url.domainToUnicode with many xn-- labels", () => {
     expect(elapsed).toBeLessThan(5000);
   });
 
-  // The per-label conversion must give the same output as the whole-name
-  // conversion that internalBinding("icu").toUnicode still runs.
-  test("matches the whole-name ICU conversion", async () => {
-    const inputs = [
-      "xn--nxa.xn--nxa.xn--nxa.com",
-      "xn--nxa..xn--nxa",
-      "xn--nxa.",
-      ".xn--nxa",
-      "xn--nxa.xn--",
-      "xn--nxa.xn--abc-",
-      "xn--nxa-",
-      "xn--nxa.ab--cd",
-      "xn--nxa.-ab.ab-",
-      "XN--NXA.Com",
-      "xn--zca.xn--zca",
-      "xn--mgbh0fb.xn--nxa",
-      "xn--4dbklr2c8d.xn--4dbrk0ce.museum",
-      "xn--mgba3a4fra.xn--fiqs8s.xn--h2brj9c",
-      "xn--ls8h.xn--nxa",
-      "xn--1ug.xn--nxa",
-      "xn--nxa.xn--1ug",
-      "xn--9ca.xn--nxa",
-      "xn--n3h.xn--nxa",
-      "xn--a.b",
-      "xn--nxa." + "xn--80aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "xn--nxa.xn--nxa.1.2.3.4",
-      "xn--nxa.0x7f.1",
-      "[::1]",
-      "ß.β.xn--nxa",
-      "xn--nxa.xn--abc.xn--nxa",
-      "xn--nxa.xn--fffd.xn--nxa",
-      "xn--nxa.xn--\u0000.xn--nxa",
-      "xn--nxa.xn--%41.xn--nxa",
-      "xn--nxa_.xn--nxa",
-      "xn--nxa.xn--nxa/path",
-      "xn--nxa.xn--nxa?query",
+  // Expected values are from Node v26.10.0: a label that fails UTS #46 stays as it is. Where every xn-- label
+  // decodes, the whole-name conversion that internalBinding("icu").toUnicode still runs must give the same output.
+  test("matches Node and, for valid labels, the whole-name ICU conversion", async () => {
+    const cases = [
+      ["xn--nxa.xn--nxa.xn--nxa.com", "β.β.β.com"],
+      ["xn--nxa..xn--nxa", "β..β"],
+      ["xn--nxa.", "β."],
+      [".xn--nxa", ".β"],
+      ["xn--nxa.xn--", "β.xn--"],
+      ["xn--nxa.xn--abc-", "β.xn--abc-"],
+      ["xn--nxa-", "xn--nxa-"],
+      ["xn--nxa.ab--cd", "β.ab--cd"],
+      ["xn--nxa.-ab.ab-", "β.-ab.ab-"],
+      ["XN--NXA.Com", "β.com"],
+      ["xn--zca.xn--zca", "ß.ß"],
+      ["xn--mgbh0fb.xn--nxa", "مثال.β"],
+      ["xn--4dbklr2c8d.xn--4dbrk0ce.museum", "איקו״ם.ישראל.museum"],
+      ["xn--mgba3a4fra.xn--fiqs8s.xn--h2brj9c", "ايران.中国.भारत"],
+      ["xn--ls8h.xn--nxa", "💩.β"],
+      ["xn--1ug.xn--nxa", "xn--1ug.β"],
+      ["xn--nxa.xn--1ug", "β.xn--1ug"],
+      ["xn--9ca.xn--nxa", "é.β"],
+      ["xn--n3h.xn--nxa", "☃.β"],
+      ["xn--a.b", "xn--a.b"],
+      [
+        "xn--nxa." + "xn--80aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "β." + Buffer.alloc(120, "а").toString(),
+      ],
+      ["xn--nxa.xn--nxa.1.2.3.4", ""],
+      ["xn--nxa.0x7f.1", ""],
+      ["[::1]", "[::1]"],
+      ["ß.β.xn--nxa", "ß.β.β"],
+      ["xn--nxa.xn--abc.xn--nxa", "β.xn--abc.β"],
+      ["xn--nxa.xn--fffd.xn--nxa", "β.xn--fffd.β"],
+      ["xn--nxa.xn--\u0000.xn--nxa", ""],
+      ["xn--nxa.xn--%41.xn--nxa", "β.xn--a.β"],
+      ["xn--nxa_.xn--nxa", "xn--nxa_.β"],
+      ["xn--nxa.xn--nxa/path", "β.β"],
+      ["xn--nxa.xn--nxa?query", "β.β"],
     ];
+    const inputs = cases.map(([input]) => input);
     await using proc = Bun.spawn({
       cmd: [
         bunExe(),
@@ -196,10 +236,11 @@ describe("url.domainToUnicode with many xn-- labels", () => {
     const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
     expect(stderr).toBe("");
     const rows = JSON.parse(stdout);
-    expect(rows).toHaveLength(inputs.length);
-    expect(rows.filter(([, , oracle]) => oracle !== "").length).toBeGreaterThan(15);
-    expect(rows.map(([input, perLabel]) => [input, perLabel])).toEqual(
-      rows.map(([input, , oracle]) => [input, oracle]),
+    expect(rows.map(([input, perLabel]) => [input, perLabel])).toEqual(cases);
+    const decoded = rows.filter(([, perLabel]) => perLabel !== "" && !/(^|\.)xn--/.test(perLabel));
+    expect(decoded.length).toBeGreaterThan(15);
+    expect(decoded.map(([input, , oracle]) => [input, oracle])).toEqual(
+      decoded.map(([input, perLabel]) => [input, perLabel]),
     );
     expect(exitCode).toBe(0);
   });

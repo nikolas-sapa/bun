@@ -1,5 +1,4 @@
 #include "NodeURL.h"
-#include "ASCIIHostPunycodeCheck.h"
 #include "ErrorCode.h"
 #include "wtf/URL.h"
 #include "wtf/URLParser.h"
@@ -58,14 +57,6 @@ static String runUIDNA(UIDNAFunction convert, const String& input, UIDNAInfo& in
 // the CheckHyphens/VerifyDnsLength error classes, fail otherwise unless lenient.
 static String icuToASCII(const String& input, IDNAMode mode)
 {
-    // Fast path: an all-ASCII domain with no punycode labels only needs
-    // lowercasing (hyphen and label-length errors are filtered anyway).
-    if (input.containsOnlyASCII()) {
-        auto lowered = input.convertToASCIILowercase();
-        if (!lowered.contains("xn--"_s))
-            return lowered;
-    }
-
     UIDNAInfo info = UIDNA_INFO_INITIALIZER;
     auto result = runUIDNA(uidna_nameToASCII, input, info);
     if (result.isNull() || (mode != IDNAMode::Lenient && hasIDNAError(info)))
@@ -124,21 +115,6 @@ static String icuParsedHostToUnicode(const String& host)
     return result.toString();
 }
 
-// WebKit's host parser fast-paths all-ASCII hosts without decoding xn--
-// labels; ada (Node) decodes and validates them. Used to reject hosts whose
-// punycode labels fail UTS #46.
-bool hasValidPunycodeHost(WTF::StringView host)
-{
-    if (!host.contains("xn--"_s))
-        return true;
-    if (host.containsOnlyASCII()) {
-        auto verdict = host.is8Bit() ? checkASCIIHostPunycode(host.span8().data(), host.length()) : checkASCIIHostPunycode(host.span16().data(), host.length());
-        if (verdict != ASCIIHostPunycodeVerdict::NeedsFullCheck)
-            return verdict == ASCIIHostPunycodeVerdict::Valid;
-    }
-    return !icuToASCII(host.toString(), IDNAMode::Default).isNull();
-}
-
 // Mirrors Node's url.domainToASCII/domainToUnicode, which run the input
 // through a WHATWG URL host parse (ada's url.set_hostname on a "ws://x"
 // base). Returns a null String when host parsing fails.
@@ -175,10 +151,7 @@ static String parseDomainAsHost(const String& domain)
     if (!url.isValid())
         return {};
 
-    String parsedHost = url.host().toString();
-    if (!hasValidPunycodeHost(parsedHost))
-        return {};
-    return parsedHost;
+    return url.host().toString();
 }
 
 // url.domainToASCII for src/boringssl/lib.rs, on any thread. Dead when the host does not parse.
@@ -242,6 +215,10 @@ JSC_DEFINE_HOST_FUNCTION(jsIDNAToASCII, (JSC::JSGlobalObject * globalObject, JSC
 
     auto input = callFrame->argument(0).toWTFString(globalObject);
     RETURN_IF_EXCEPTION(scope, {});
+
+    // https://url.spec.whatwg.org/#concept-domain-to-ascii: an ASCII domain is the result, lowercased (whatwg/url#914).
+    if (input.containsOnlyASCII())
+        return JSC::JSValue::encode(JSC::jsString(vm, input.convertToASCIILowercase()));
 
     auto result = icuToASCII(input, IDNAMode::Default);
     if (result.isNull())
