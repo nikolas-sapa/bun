@@ -5834,11 +5834,14 @@ describe("setLocalWindowSize() and bodies larger than the initial stream window"
 // earn no WINDOW_UPDATE. A later raise first repays the withheld credit and sends only the rest.
 // The decrease used to be ignored, so the raise granted the peer more window than was asked for.
 describe("setLocalWindowSize() with a smaller window", () => {
-  // A raw h2 server that records each connection-level WINDOW_UPDATE increment it receives.
-  // `incrementsAtPing` holds a copy of the increments for each PING, taken before the answer.
+  // A raw h2 server that records each connection-level WINDOW_UPDATE increment it receives, and
+  // each stream-level one as [streamId, increment]. The `...AtPing` arrays hold a copy of both
+  // for each PING, taken before the answer.
   async function windowUpdateServer(onRequest = () => {}) {
     const increments = [];
     const incrementsAtPing = [];
+    const streamIncrements = [];
+    const streamIncrementsAtPing = [];
     const server = net.createServer(socket => {
       let buf = Buffer.alloc(0);
       let sawPreface = false;
@@ -5862,15 +5865,18 @@ describe("setLocalWindowSize() with a smaller window", () => {
           if (type === 4 && !isAck) socket.write(new http2utils.SettingsFrame(true).data);
           if (type === 6 && !isAck) {
             incrementsAtPing.push([...increments]);
+            streamIncrementsAtPing.push([...streamIncrements]);
             socket.write(Buffer.concat([new http2utils.Frame(8, 6, 1, 0).data, payload]));
           }
           if (type === 8 && streamId === 0) increments.push(payload.readUInt32BE(0) & 0x7fffffff);
+          if (type === 8 && streamId !== 0) streamIncrements.push([streamId, payload.readUInt32BE(0) & 0x7fffffff]);
           if (type === 1) onRequest(socket, streamId);
         }
       });
     });
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-    return { server, increments, incrementsAtPing, url: `http://127.0.0.1:${server.address().port}` };
+    const url = `http://127.0.0.1:${server.address().port}`;
+    return { server, increments, incrementsAtPing, streamIncrementsAtPing, url };
   }
 
   function windowState(session) {
@@ -6079,6 +6085,76 @@ describe("setLocalWindowSize() with a smaller window", () => {
     } finally {
       client.destroy();
       serverSession?.destroy();
+      server.close();
+    }
+  });
+
+  // JS that runs inside that write can also resume a paused stream of the same session. The
+  // session is busy then, so it must send the stream's WINDOW_UPDATE once the call is over. It
+  // used to leave the peer without stream window until the next frame came in.
+  it("a stream resumed while setLocalWindowSize() writes its WINDOW_UPDATE gets its window back", async () => {
+    let nested = () => {};
+    const duplex = new Duplex({
+      read() {},
+      write(chunk, encoding, callback) {
+        nested();
+        callback();
+      },
+    });
+    const other = http2.connect("http://127.0.0.1:1", { createConnection: () => duplex });
+    other.on("error", () => {});
+    await new Promise(resolve => other.once("connect", resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    // 80000 bytes: more than the 64 KiB that the stream buffers, so the stream is paused and its
+    // WINDOW_UPDATE waits for a read. It is also most of the 100000 that both windows allow.
+    const { server, incrementsAtPing, streamIncrementsAtPing, url } = await windowUpdateServer((socket, streamId) => {
+      socket.write(new http2utils.HeadersFrame(streamId, Buffer.from([0x88]), 0, true).data); // :status 200
+      for (const size of [16384, 16384, 16384, 16384, 14464]) {
+        socket.write(new http2utils.DataFrame(streamId, Buffer.alloc(size, "x")).data);
+      }
+    });
+    const client = http2.connect(url, { settings: { initialWindowSize: 100000 } });
+    try {
+      const { promise, resolve, reject } = Promise.withResolvers();
+      client.on("error", reject);
+      client.once("connect", () => {
+        // The peer learns about 100000 bytes of connection window. All of it is then withheld.
+        client.setLocalWindowSize(100000);
+        client.setLocalWindowSize(0);
+        const req = client.request({ ":path": "/" });
+        req.on("error", reject);
+        // The server answers this PING after the DATA, so all 80000 bytes are in by then.
+        client.ping(() =>
+          setImmediate(() => {
+            // The raise repays the 80000 bytes that the peer used, so it writes a WINDOW_UPDATE.
+            // That write flushes the PING that `other` corked, and the flush runs the read().
+            let resumed = false;
+            nested = () => {
+              nested = () => {};
+              resumed = req.read() !== null;
+            };
+            other.ping(() => {});
+            client.setLocalWindowSize(100000);
+            client.ping(() =>
+              resolve({
+                resumed,
+                increments: incrementsAtPing.at(-1),
+                streamIncrements: streamIncrementsAtPing.at(-1),
+              }),
+            );
+          }),
+        );
+      });
+      // Both frames are on the wire before the last PING. No frame came in between.
+      expect(await promise).toEqual({
+        resumed: true,
+        increments: [100000 - 65535, 80000],
+        streamIncrements: [[1, 80000]],
+      });
+    } finally {
+      other.destroy();
+      client.destroy();
       server.close();
     }
   });
