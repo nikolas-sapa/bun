@@ -595,7 +595,7 @@ impl Connection {
     }
 
     /// Send WINDOW_UPDATE for every receive window that has consumed at least half its size.
-    fn replenish_windows(&mut self, sink: &impl Sink) {
+    pub(crate) fn replenish_windows(&mut self, sink: &impl Sink) {
         self.sync_recv_window(sink);
         let mut buf = std::mem::take(&mut self.replenish_buf);
         buf.clear();

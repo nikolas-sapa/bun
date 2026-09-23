@@ -1108,6 +1108,8 @@ pub(crate) struct H2FrameParser {
     /// borrow (the normal request path: receive() -> JS handler -> respond -> END_STREAM).
     /// Drained into Connection::close_stream on the next rewrite_read batch.
     pending_engine_stream_closes: JsCell<Vec<u32>>,
+    /// A call that needs the idle engine found it borrowed. The holder runs the batch end for it.
+    engine_work_deferred: Cell<bool>,
     dispatch_depth: Cell<u32>,
     max_rejected_streams: Cell<u32>,
     max_session_invalid_frames: Cell<u32>,
@@ -3548,17 +3550,21 @@ impl H2FrameParser {
         }
     }
 
-    /// Runs `f` on the idle engine, then reads what a re-entrant read() queued while `f` wrote.
+    /// Runs `f` on the idle engine, then does what JS deferred or queued while `f` wrote.
     fn with_idle_engine(&self, f: impl FnOnce(&mut crate::api::h2::connection::Connection)) {
         let queued = self.rewrite_tail.get().len();
         {
             let Ok(mut guard) = self.engine.try_borrow_mut() else {
+                self.engine_work_deferred.set(true);
                 return;
             };
             let Some(engine) = guard.as_mut() else {
                 return;
             };
             f(engine);
+            while self.engine_work_deferred.replace(false) {
+                engine.replenish_windows(self);
+            }
         }
         if self.rewrite_tail.get().len() != queued {
             self.rewrite_read(&[]);
@@ -3707,6 +3713,8 @@ impl H2FrameParser {
                 break;
             }
         }
+        // The batch ends above covered every call that found the engine borrowed.
+        self.engine_work_deferred.set(false);
         // Uncork: flush the engine's queued control/response frames to the socket.
         let _ = self.flush();
     }
@@ -5441,9 +5449,7 @@ impl H2FrameParser {
         // SAFETY: stream is a *mut Stream from self.streams (heap::alloc); valid while the map entry exists
         unsafe { (*stream).reading_paused = !reading };
         if reading {
-            // Resumed: send the deferred WINDOW_UPDATE now. try_borrow: a resume issued from
-            // inside a dispatch (the engine borrow is held by rewrite_read) is covered by the
-            // batch-end replenish instead.
+            // Resumed: send the deferred WINDOW_UPDATE now. A busy engine's holder sends it.
             this.with_idle_engine(|engine| engine.replenish_stream(this, stream_id));
             let _ = this.flush();
         }
@@ -7450,6 +7456,7 @@ impl H2FrameParser {
             pending_send_window_consumed: Cell::new(0),
             pending_stream_send_consumed: JsCell::new(Vec::new()),
             pending_engine_stream_closes: JsCell::new(Vec::new()),
+            engine_work_deferred: Cell::new(false),
             dispatch_depth: Cell::new(0),
             pending_settings_window_submissions: JsCell::new(Vec::new()),
             max_rejected_streams: Cell::new(100),
