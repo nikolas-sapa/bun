@@ -6037,6 +6037,52 @@ describe("setLocalWindowSize() with a smaller window", () => {
     }
   });
 
+  // The write that flushes another session's frames can deliver them to this same session: both
+  // ends of an in-process pair share one cork. The session is busy then, so it must read them
+  // once the call is over. It used to leave them unread until the next frame came in.
+  it("frames that arrive while setLocalWindowSize() writes its WINDOW_UPDATE are read", async () => {
+    const [clientSide, serverSide] = duplexPair();
+    const server = http2.createServer();
+    const { promise, resolve, reject } = Promise.withResolvers();
+    let serverSession;
+    server.on("session", session => {
+      serverSession = session;
+      // The client may still send the 65535 bytes that it was told about.
+      session.setLocalWindowSize(0);
+    });
+    server.on("stream", stream => {
+      let received = 0;
+      stream.on("data", chunk => {
+        received += chunk.length;
+        if (received !== 65535) return;
+        setImmediate(() => {
+          // The client corks a PING. The raise repays credit that the client used, so a
+          // WINDOW_UPDATE is due, and that write flushes the PING into the server session.
+          client.ping(err => (err ? reject(err) : resolve(windowState(serverSession))));
+          serverSession.setLocalWindowSize(65535);
+        });
+      });
+    });
+    server.emit("connection", serverSide);
+    const client = http2.connect("http://localhost", { createConnection: () => clientSide });
+    try {
+      client.on("error", reject);
+      const req = client.request({ ":path": "/", ":method": "POST" });
+      req.on("error", reject);
+      req.end(Buffer.alloc(65535, "x"));
+      // The client sends nothing after the PING, so only the server's own read can answer it.
+      expect(await promise).toEqual({
+        effectiveLocalWindowSize: 65535,
+        localWindowSize: 65535,
+        effectiveRecvDataLength: 0,
+      });
+    } finally {
+      client.destroy();
+      serverSession?.destroy();
+      server.close();
+    }
+  });
+
   // RFC 9113 section 6.9.1: a WINDOW_UPDATE that takes a window above 2^31-1 is a
   // FLOW_CONTROL_ERROR. The raise used to send all of 2^31-1, on top of the 65535 bytes that
   // the peer still had, so a compliant peer ended the session.
