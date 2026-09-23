@@ -164,6 +164,7 @@ describe("bundler", () => {
   <body>
     <img src="./sprite&#x26;2.svg?v=3#home">
     <img src="./photo.jpg?w=100&amp;h=50">
+    <img src="./photo.jpg?raw=1&x=2">
   </body>
 </html>`,
       "/a&b.css": "body { color: red; }",
@@ -180,13 +181,58 @@ describe("bundler", () => {
       expect(html).toContain('src="//cdn.example.com/lib.js"');
       expect(html).toMatch(/href="\.\/icön-[a-z0-9]+\.png"/);
       expect(html).toMatch(/src="\.\/sprite&2-[a-z0-9]+\.svg\?v=3#home"/);
-      // The query is kept as written: `&amp;` is how HTML spells `&` there too.
+      // The query is decoded with the rest of the value, so its "&" goes back as "&amp;".
       expect(html).toMatch(/src="\.\/photo-[a-z0-9]+\.jpg\?w=100&amp;h=50"/);
+      expect(html).toMatch(/src="\.\/photo-[a-z0-9]+\.jpg\?raw=1&amp;x=2"/);
       expect(html).not.toContain("%");
       const js = api.readFile("out/" + html.match(/src="\.\/(index-[a-z0-9]+\.js)"/)![1]);
       expect(js).toContain("my script");
       const css = api.readFile("out/" + html.match(/href="\.\/(index-[a-z0-9]+\.css)"/)![1]);
       expect(css).toContain("color: red");
+    },
+  });
+
+  // A path the decoder cannot turn into a file name is resolved as written, so
+  // the build fails with the text of the page: a malformed escape, bytes that
+  // are not UTF-8, and an escape for a byte that the output URL cannot carry
+  // as itself. Each file below exists under its decoded name.
+  itBundled("html/url-decoding-keeps-unsafe-path-as-written", {
+    outdir: "out/",
+    files: {
+      "/index.html": `
+<!DOCTYPE html>
+<html>
+  <head>
+    <link rel="icon" href="%PUBLIC_URL%/favicon.ico">
+  </head>
+  <body>
+    <img src="./caf%E9.png">
+    <img src="./%80.png">
+    <img src="./s&#xD800;s.png">
+    <img src="./h%23ash.png">
+    <img src="./100%25.png">
+    <img src="./dir%2Fphoto.png">
+    <img srcset="./my%20img.png">
+  </body>
+</html>`,
+      "/favicon.ico": "icon",
+      "/h#ash.png": "hash",
+      "/100%.png": "percent",
+      "/dir/photo.png": "slash",
+      "/my img.png": "space",
+    },
+    entryPoints: ["/index.html"],
+    bundleErrors: {
+      "/index.html": [
+        `Could not resolve: "%PUBLIC_URL%/favicon.ico"`,
+        `Could not resolve: "./caf%E9.png"`,
+        `Could not resolve: "./%80.png"`,
+        `Could not resolve: "./s\uFFFDs.png"`,
+        `Could not resolve: "./h%23ash.png"`,
+        `Could not resolve: "./100%25.png"`,
+        `Could not resolve: "./dir%2Fphoto.png"`,
+        `Could not resolve: "./my%20img.png"`,
+      ],
     },
   });
 

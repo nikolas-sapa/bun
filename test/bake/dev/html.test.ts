@@ -101,16 +101,25 @@ devTest("image tag keeps ?query#fragment", {
     "index.html": `
       <!DOCTYPE html><html><head></head><body>
       <img src="./image.png?v=1#frag" alt="test image">
+      <img src="https://example.com/sprite.svg?a=1&amp;b=2#icon">
+      <img src="//cdn.example.com/sprite.svg#icon">
       </body></html>
     `,
     "image.png": "FIRST",
   },
   async test(dev) {
-    const imgSrc = async () => (await (await dev.fetch("/")).text()).match(/<img src="([^"]*)"/)?.[1];
+    const imgSrcs = async () =>
+      [...(await (await dev.fetch("/")).text()).matchAll(/<img src="([^"]*)"/g)].map(m => m[1]);
+    const imgSrc = async () => (await imgSrcs())[0];
 
     const url = await imgSrc();
     expect(url).toMatch(/^\/_bun\/asset\/[0-9a-f]{16}\.png\?v=1#frag$/);
     await dev.fetch(url!).expect.toBe("FIRST");
+    // A remote URL is not rewritten, so its ?query#fragment is there once, as written.
+    expect((await imgSrcs()).slice(1)).toEqual([
+      "https://example.com/sprite.svg?a=1&amp;b=2#icon",
+      "//cdn.example.com/sprite.svg#icon",
+    ]);
 
     // An HTML edit re-renders the page against the asset the dev server has already cached.
     await dev.patch("index.html", {

@@ -352,6 +352,26 @@ body { color: blue; }`,
     expect(html).toContain('console.log("with image")');
   });
 
+  test("keeps the #fragment of an inlined asset, not its ?query", async () => {
+    using dir = tempDir("compile-browser-asset-fragment", {
+      // "&#38;" is "&". Its "#" is part of the query, not the start of the fragment.
+      "index.html": `<!DOCTYPE html>
+<html><body><img src="./sprite.svg?a=1&#38;b=2#icon"><img src="./sprite.svg?v=3"></body></html>`,
+      "sprite.svg": `<svg xmlns="http://www.w3.org/2000/svg"><symbol id="icon"/></svg>`,
+    });
+
+    const result = await Bun.build({
+      entrypoints: [`${dir}/index.html`],
+      compile: true,
+      target: "browser",
+    });
+
+    expect(result.success).toBe(true);
+    const html = await result.outputs[0].text();
+    const srcs = [...html.matchAll(/<img src="([^"]*)"/g)].map(m => m[1].replace(/^data:[^#]*/, "data:"));
+    expect(srcs).toEqual(["data:#icon", "data:"]);
+  });
+
   test("handles CSS url() references", async () => {
     const pixel = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4DwAAAQEABRjYTgAAAABJRU5ErkJggg==",

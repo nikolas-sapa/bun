@@ -6,6 +6,7 @@ use crate::bun_fs as fs;
 use bun_alloc::AstAlloc;
 use bun_ast::{ImportKind, ImportRecord, ImportRecordFlags, ImportRecordTag, Index as AstIndex};
 use bun_ast::{Loc, Log, Range, Source};
+use bun_core::strings;
 use bun_paths::fs::Path as FsPath;
 use bun_paths::{platform, resolve_path};
 use bun_sys as sys;
@@ -67,27 +68,64 @@ impl<'a> HTMLScanner<'a> {
     }
 }
 
-/// The code point named by the `&name;` character reference, for the names
-/// that can appear in a URL attribute: `amp`, `lt`, `gt`, `quot`, `apos`
-/// and the numeric forms `#NNN` / `#xHH`.
-fn char_ref_code_point(name: &[u8]) -> Option<u32> {
-    let cp = match name {
-        b"amp" => '&' as u32,
-        b"lt" => '<' as u32,
-        b"gt" => '>' as u32,
-        b"quot" => '"' as u32,
-        b"apos" => '\'' as u32,
-        [b'#', b'x' | b'X', hex @ ..] if !hex.is_empty() => {
-            u32::from_str_radix(core::str::from_utf8(hex).ok()?, 16).ok()?
-        }
-        [b'#', dec @ ..] if !dec.is_empty() => core::str::from_utf8(dec).ok()?.parse().ok()?,
+/// The character reference at the start of `text` and its length. Like the
+/// HTML parser, a number that names no usable character reads as U+FFFD.
+fn char_ref(text: &[u8]) -> Option<(char, usize)> {
+    const NAMED: [(&[u8], char); 5] = [
+        (b"&amp;", '&'),
+        (b"&lt;", '<'),
+        (b"&gt;", '>'),
+        (b"&quot;", '"'),
+        (b"&apos;", '\''),
+    ];
+    if let Some((name, c)) = NAMED.iter().find(|(name, _)| text.starts_with(name)) {
+        return Some((*c, name.len()));
+    }
+    let (radix, digits_at) = match text {
+        [b'&', b'#', b'x' | b'X', ..] => (16, 3),
+        [b'&', b'#', ..] => (10, 2),
         _ => return None,
     };
-    (cp != 0 && cp <= 0x10FFFF).then_some(cp)
+    let mut code_point = Some(0u32);
+    let mut end = digits_at;
+    while let Some(digit) = text.get(end).and_then(|&d| char::from(d).to_digit(radix)) {
+        code_point = code_point.and_then(|value| value.checked_mul(radix)?.checked_add(digit));
+        end += 1;
+    }
+    if end == digits_at || text.get(end) != Some(&b';') {
+        return None;
+    }
+    let c = code_point
+        .and_then(char::from_u32)
+        .filter(|c| !c.is_control())
+        .unwrap_or(char::REPLACEMENT_CHARACTER);
+    Some((c, end + 1))
 }
 
-/// True for `scheme:...` (RFC 3986 scheme syntax) and for `//host/...`.
-/// Neither names a local file, so the resolver marks them external as-is.
+/// The URL that an attribute value spells (`&amp;` is how HTML writes `&`).
+fn decode_char_refs(value: &[u8]) -> Cow<'_, [u8]> {
+    let Some(mut ampersand) = strings::index_of_char_usize(value, b'&') else {
+        return Cow::Borrowed(value);
+    };
+    let mut url = Vec::with_capacity(value.len());
+    let mut rest = value;
+    loop {
+        url.extend_from_slice(&rest[..ampersand]);
+        rest = &rest[ampersand..];
+        let (c, len) = char_ref(rest).unwrap_or(('&', 1));
+        url.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+        rest = &rest[len..];
+        match strings::index_of_char_usize(rest, b'&') {
+            Some(next) => ampersand = next,
+            None => {
+                url.extend_from_slice(rest);
+                return Cow::Owned(url);
+            }
+        }
+    }
+}
+
+/// `scheme:...` or `//host/...`. The resolver marks it external as written.
 fn url_is_remote(url: &[u8]) -> bool {
     if url.starts_with(b"//") {
         return true;
@@ -101,59 +139,76 @@ fn url_is_remote(url: &[u8]) -> bool {
     len > 0 && url[0].is_ascii_alphabetic() && url.get(len) == Some(&b':')
 }
 
-/// The character reference at the start of `text` as a code point and the
-/// number of bytes it spans, when there is one.
-fn char_ref(text: &[u8]) -> Option<(u32, usize)> {
-    if text.first() != Some(&b'&') {
-        return None;
+/// Where the `?query#fragment` starts. `#top` alone has no path before it.
+fn url_suffix_index(url: &[u8]) -> usize {
+    match strings::index_of_any(url, b"?#") {
+        Some(0) | None => url.len(),
+        Some(index) => index,
     }
-    let end = bun_core::strings::index_of_char_usize(text, b';')?;
-    Some((char_ref_code_point(&text[1..end])?, end + 1))
 }
 
-/// Splits a `src`/`href` attribute value into the URL path it names, with its
-/// HTML character references decoded (`&amp;` is how HTML spells `&`), and
-/// the `?query#fragment` text after it, kept as written.
-pub(crate) fn split_url(value: &[u8]) -> (Vec<u8>, &[u8]) {
-    let mut path = Vec::with_capacity(value.len());
-    let mut i = 0;
-    while i < value.len() {
-        let mut buf = [0u8; 4];
-        let (bytes, consumed): (&[u8], usize) = match char_ref(&value[i..]) {
-            Some((cp, consumed)) => {
-                let len = bun_core::strings::encode_wtf8_rune(&mut buf, cp);
-                (&buf[..len], consumed)
-            }
-            None => (&value[i..i + 1], 1),
-        };
-        if !path.is_empty() && matches!(bytes[0], b'?' | b'#') {
-            return (path, &value[i..]);
-        }
-        path.extend_from_slice(bytes);
-        i += consumed;
+/// The `?query#fragment` of a local `src`/`href` value. Empty for a remote URL.
+pub(crate) fn url_suffix(value: &[u8]) -> Cow<'_, [u8]> {
+    let url = decode_char_refs(value);
+    if url_is_remote(&url) {
+        return Cow::Borrowed(b"");
     }
-    (path, b"")
+    let index = url_suffix_index(&url);
+    match url {
+        Cow::Borrowed(url) => Cow::Borrowed(&url[index..]),
+        Cow::Owned(mut url) => {
+            url.drain(..index);
+            Cow::Owned(url)
+        }
+    }
+}
+
+/// The file name that a URL path spells. `None` keeps the path as written: a
+/// malformed escape (`%PUBLIC_URL%`), bytes that are not UTF-8 (`%E9`), or a
+/// byte that the output URL, which is the raw file name, cannot carry as itself.
+fn percent_decode(path: &[u8]) -> Option<Vec<u8>> {
+    let mut escape = strings::index_of_char_usize(path, b'%')?;
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut rest = path;
+    loop {
+        let byte = bun_core::fmt::hex_pair_value(*rest.get(escape + 1)?, *rest.get(escape + 2)?)?;
+        if byte.is_ascii_control() || matches!(byte, b'#' | b'?' | b'%' | b'/' | b'\\') {
+            return None;
+        }
+        decoded.extend_from_slice(&rest[..escape]);
+        decoded.push(byte);
+        rest = &rest[escape + 3..];
+        match strings::index_of_char_usize(rest, b'%') {
+            Some(next) => escape = next,
+            None => break,
+        }
+    }
+    decoded.extend_from_slice(rest);
+    strings::is_valid_utf8(&decoded).then_some(decoded)
 }
 
 impl<'a> HTMLScanner<'a> {
-    fn create_import_record(&mut self, value: &[u8], kind: ImportKind) -> Result<(), Error> {
-        let is_remote = url_is_remote(value);
+    fn create_import_record(
+        &mut self,
+        value: &[u8],
+        url_attribute: &[u8],
+        kind: ImportKind,
+    ) -> Result<(), Error> {
+        // A `srcset` is a list of URLs, not a URL. It is resolved as written.
+        let is_url = url_attribute != b"srcset";
+        let url = if is_url {
+            decode_char_refs(value)
+        } else {
+            Cow::Borrowed(value)
+        };
+        let is_remote = url_is_remote(&url);
         let decoded;
-        let input_path: &[u8] = if is_remote {
+        let input_path: &[u8] = if is_remote || !is_url {
             value
         } else {
-            let (path, _suffix) = split_url(value);
-            // The file name as a browser or a static file server reads it from
-            // the URL. An invalid escape leaves the path as written.
-            let mut percent_decoded = Vec::with_capacity(path.len());
-            decoded = match bun_url::PercentEncoding::decode_fault_tolerant::<_, true>(
-                &mut percent_decoded,
-                &path,
-            ) {
-                Ok(_) => percent_decoded,
-                Err(_) => path,
-            };
-            &decoded
+            let path = &url[..url_suffix_index(&url)];
+            decoded = percent_decode(path);
+            decoded.as_deref().unwrap_or(path)
         };
         // In HTML, sometimes people do /src/index.js
         // In that case, we don't want to use the absolute filesystem path, we want to use the path relative to the project root
@@ -229,8 +284,7 @@ impl<'a> HTMLScanner<'a> {
         url_attribute: &[u8],
         kind: ImportKind,
     ) {
-        let _ = url_attribute;
-        let _ = self.create_import_record(path, kind);
+        let _ = self.create_import_record(path, url_attribute, kind);
     }
 
     pub(crate) fn scan(&mut self, input: &[u8]) -> Result<(), Error> {
