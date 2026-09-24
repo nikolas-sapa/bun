@@ -13,6 +13,17 @@ NEVER_INLINE bool RejectedPromiseQueue::wasReported(JSC::JSPromise* promise)
     return m_reported->has(promise);
 }
 
+// Called under the cell lock, when the vector is full. Handled promises go first: a turn that keeps rejecting and
+// handling, but never the newest one, would otherwise keep every promise until the drain.
+NEVER_INLINE void RejectedPromiseQueue::makeRoom()
+{
+    size_t capacity = m_entries.capacity();
+    if (capacity >= 64)
+        m_entries.removeAllMatching([](const Entry& entry) { return isHandled(entry); });
+    if (!capacity || m_entries.size() > capacity / 2)
+        m_entries.reserveCapacity(std::max<size_t>(16, capacity * 2));
+}
+
 void RejectedPromiseQueue::markReported(JSC::JSGlobalObject* owner, JSC::JSPromise* promise)
 {
     JSC::VM& vm = owner->vm();

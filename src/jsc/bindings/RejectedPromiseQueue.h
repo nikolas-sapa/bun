@@ -33,9 +33,9 @@ private:
     };
     static bool isHandled(const Entry& entry) { return static_cast<JSC::JSPromise*>(entry.promise.get().asCell())->isHandled(); }
     bool wasReported(JSC::JSPromise*);
-    void sweep();
+    void makeRoom();
 
-    // In rejection order. A handled promise stays until it is at the end, sweep() runs, or the drain.
+    // In rejection order. A handled promise stays until it is at the end, makeRoom() runs, or the drain.
     WTF::Vector<Entry> m_entries;
     // Promises reported as unhandled. Weak: a reported promise that dies leaves it.
     JSC::WriteBarrier<JSC::JSWeakSet> m_reported;
@@ -45,7 +45,9 @@ private:
 ALWAYS_INLINE void RejectedPromiseQueue::append(JSC::VM& vm, JSC::JSCell* owner, JSC::JSPromise* promise, JSC::JSObject* rejectionOwner)
 {
     WTF::Locker locker { owner->cellLock() };
-    m_entries.append({});
+    if (m_entries.size() == m_entries.capacity()) [[unlikely]]
+        makeRoom();
+    m_entries.unsafeAppendWithoutCapacityCheck(Entry {});
     m_entries.last().promise.set(vm, owner, promise);
     m_entries.last().rejectionOwner.set(vm, owner, rejectionOwner ? JSC::JSValue(rejectionOwner) : JSC::jsNull());
 }
