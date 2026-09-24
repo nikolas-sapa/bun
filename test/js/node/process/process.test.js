@@ -1832,23 +1832,28 @@ describe.concurrent(() => {
     expect({ stdout: stdout.trim(), stderr, exitCode }).toEqual({ stdout: "ok", stderr: "", exitCode: 0 });
   });
 
-  // Pins which events fire, and in what order, for every way the queue of
-  // unreported rejections finds and drops a handled promise: a hole left in the
-  // middle, compaction, the next in order, a pop from the back, a short queue,
-  // an indexed queue that shrinks and grows again, and the batch that is being
-  // reported. The "handling N rejected promises is O(N)" tests below cover the cost.
+  // Pins which events fire, and in what order, whatever order the rejections of a
+  // turn are handled in, and that the queue keeps a promise alive exactly as long
+  // as it can still be reported. The "handling N rejected promises is O(N)" tests
+  // below cover the cost.
   it("reports exactly the rejections that stay unhandled, in order, whatever order the others are handled in", async () => {
     await using proc = Bun.spawn({
       cmd: [
         bunExe(),
         "-e",
         `
+          const { heapStats } = require("bun:jsc");
           const noop = () => {};
           const drain = async () => { for (let i = 0; i < 3; i++) await new Promise(r => setImmediate(r)); };
+          // Nothing else in this script makes a Date, so this counts the rejection reasons that are alive.
+          const datesAlive = () => (Bun.gc(true), heapStats().objectTypeCounts.Date ?? 0);
           let seen = [];
           let rejectionHandled = 0;
           let onUnhandled = noop;
-          process.on("unhandledRejection", reason => { seen.push(reason); onUnhandled(reason); });
+          process.on("unhandledRejection", reason => {
+            seen.push(reason instanceof Date ? reason.getTime() : reason);
+            onUnhandled(reason);
+          });
           process.on("rejectionHandled", () => rejectionHandled++);
           const result = {};
 
@@ -1856,16 +1861,30 @@ describe.concurrent(() => {
           // step late, when it is no longer the newest rejection.
           let previous;
           for (let i = 0; i < 1000; i++) {
-            const promise = Promise.reject(i);
+            const promise = Promise.reject(i % 7 === 0 ? new Date(i) : i);
             if (i % 7 === 0) continue;
             previous?.catch(noop);
             previous = promise;
           }
           previous.catch(noop);
-          // The promises that stay unhandled are reachable only through the queue now.
-          Bun.gc(true);
+          // The promises that stay unhandled, and their reasons, are reachable only through the queue now.
+          const queuedAlive = datesAlive();
           await drain();
-          result.oneStepLate = { seen, rejectionHandled };
+          result.oneStepLate = { seen, rejectionHandled, queuedAlive };
+
+          // The same in a loop that awaits, so that each handled promise is garbage at once. The queue
+          // must not keep them until the end of the turn: the number alive stays far below the 2,000 made.
+          const before = datesAlive();
+          let mostAlive = 0;
+          previous = Promise.reject(new Date(0));
+          for (let i = 1; i <= 2000; i++) {
+            const promise = Promise.reject(new Date(i));
+            try { await previous; } catch {}
+            previous = promise;
+            if (i % 500 === 0) mostAlive = Math.max(mostAlive, datesAlive() - before);
+          }
+          try { await previous; } catch {}
+          result.handledAreReleased = mostAlive < 200 ? true : mostAlive;
 
           // Handled oldest first, as Promise.all does. Every 50th stays unhandled.
           seen = [];
@@ -1938,7 +1957,12 @@ describe.concurrent(() => {
     const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
     expect(stderr).toBe("");
     expect(JSON.parse(stdout)).toEqual({
-      oneStepLate: { seen: Array.from({ length: Math.ceil(1000 / 7) }, (_, i) => i * 7), rejectionHandled: 0 },
+      oneStepLate: {
+        seen: Array.from({ length: Math.ceil(1000 / 7) }, (_, i) => i * 7),
+        rejectionHandled: 0,
+        queuedAlive: Math.ceil(1000 / 7),
+      },
+      handledAreReleased: true,
       oldestFirst: { seen: ["o49", "o99", "o149", "o199"], rejectionHandled: 0 },
       newestFirst: { seen: ["n0", "n50"], rejectionHandled: 0 },
       few: { seen: ["f1", "f2", "f5"], rejectionHandled: 0 },
